@@ -37,6 +37,7 @@ A comprehensive MQL5 Expert Advisor that provides detailed trading performance r
 - `account_title`: Your account name for reports
 - `LogLevel`: Logging verbosity level
 
+```
 ## 📊 Sample Report
 🚀 ACCOUNT XX TRADING REPORT ��
 ⚡ LIVE PERFORMANCE UPDATE ⚡
@@ -52,3 +53,34 @@ A comprehensive MQL5 Expert Advisor that provides detailed trading performance r
 2025.08.04 | 394 | ¢ ✅ +224.90
 2025.08.05 | 312 | ¢ ✅ +141.55
 �� KEEP TRADING, KEEP WINNING! 💪
+```
+
+## ��️ Technical Details
+
+- **Language**: MQL5
+- **Compatible**: MetaTrader 5
+- **Data Processing**: Pandas-like comprehensive trade history
+- **Memory Usage**: Optimized for large trade histories
+- **Update Frequency**: Configurable (default: 30 minutes)
+
+## 📈 Performance Features
+
+- **742+ trades** processed in real-time
+- **Comprehensive balance tracking**
+- **Accurate drawdown calculations**
+- **Beautiful Telegram formatting**
+- **Professional trading insights**
+
+## �� Contributing
+
+Feel free to fork and improve this EA!
+
+## 📄 License
+
+MIT License - feel free to use and modify
+
+## ⭐ Support
+
+If you find this useful, please give it a star! ⭐
+
+---
