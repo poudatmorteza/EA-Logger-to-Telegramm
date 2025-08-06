@@ -16,6 +16,7 @@
 #include <Trade\HistoryOrderInfo.mqh>
 #include <Trade\DealInfo.mqh>
 
+
 // Enumerations
 enum ENUM_LOG_LEVEL
 {
@@ -50,7 +51,10 @@ input string   BotName         = "Trading Logger";             // Bot Name
 
 // Report Settings
 input string   ReportSettings = "===== Report Settings ====="; // Report Settings
-input int      ReportInterval = 30;                            // Report Interval (minutes)
+input int      ReportInterval = 30;                            // Detailed Report Interval (minutes)
+input int      HourlyReportInterval = 60;                      // Hourly Report Interval (minutes)
+input bool     SendDetailedReport = true;                      // Send Detailed Reports
+input bool     SendHourlyReport = true;                        // Send Hourly Reports
 
 // Global Variables
 CTrade trade;
@@ -68,6 +72,9 @@ struct TradeRecord
    double openPrice;
    double closePrice;
    double profit;
+   double swap;
+   double commission;
+   double netProfit;
    double balanceBefore;
    double balanceAfter;
    double equityBefore;
@@ -91,8 +98,9 @@ struct TradingStats
    double botMaxDD;        // Now tracks max DD percentage
    double maxCurrentDD;    // Track maximum Current DD percentage
    
-   // Last report time
-   datetime lastReportSent;
+   // Last report times
+   datetime lastDetailedReportSent;
+   datetime lastHourlyReportSent;
    
    // Trade history
    TradeRecord tradeHistory[];
@@ -148,7 +156,7 @@ int OnInit()
       {
          Print("⚠️ Telegram startup message failed - check your bot configuration");
       }
-      }
+   }
    
    // Start timer for periodic reports
    EventSetTimer(60); // Timer every 60 seconds
@@ -183,11 +191,18 @@ void OnTick()
    // Update statistics
    UpdateStats();
    
-   // Check for periodic report
-   if(TimeCurrent() - stats.lastReportSent >= ReportInterval * 60)
+   // Check for detailed report
+   if(SendDetailedReport && TimeCurrent() - stats.lastDetailedReportSent >= ReportInterval * 60)
    {
-      SendPeriodicReport();
-      stats.lastReportSent = TimeCurrent();
+      SendDetailedReportFunction();
+      stats.lastDetailedReportSent = TimeCurrent();
+   }
+   
+   // Check for short summary report
+   if(SendHourlyReport && TimeCurrent() - stats.lastHourlyReportSent >= HourlyReportInterval * 60)
+   {
+      SendHourlyReportFunction();
+      stats.lastHourlyReportSent = TimeCurrent();
    }
 }
 
@@ -217,8 +232,9 @@ void InitializeStats()
    stats.botMaxDD = 0;
    stats.maxCurrentDD = 0; // Initialize maxCurrentDD
    
-   // Set last report time
-   stats.lastReportSent = TimeCurrent();
+   // Set last report times
+   stats.lastDetailedReportSent = TimeCurrent();
+   stats.lastHourlyReportSent = TimeCurrent();
    
    // Initialize trade history
    stats.tradeHistoryCount = 0;
@@ -286,11 +302,13 @@ void BuildTradeHistory()
          if(dealType == DEAL_TYPE_BUY || dealType == DEAL_TYPE_SELL)
          {
             // This is a trade
-            datetime dealTime = (datetime)HistoryDealGetInteger(dealTicket, DEAL_TIME);
-            double dealProfit = HistoryDealGetDouble(dealTicket, DEAL_PROFIT);
-            double dealVolume = HistoryDealGetDouble(dealTicket, DEAL_VOLUME);
+         datetime dealTime = (datetime)HistoryDealGetInteger(dealTicket, DEAL_TIME);
+         double dealProfit = HistoryDealGetDouble(dealTicket, DEAL_PROFIT);
+         double dealVolume = HistoryDealGetDouble(dealTicket, DEAL_VOLUME);
             string dealSymbol = HistoryDealGetString(dealTicket, DEAL_SYMBOL);
             double dealPrice = HistoryDealGetDouble(dealTicket, DEAL_PRICE);
+            double dealSwap = HistoryDealGetDouble(dealTicket, DEAL_SWAP);
+            double dealCommission = HistoryDealGetDouble(dealTicket, DEAL_COMMISSION);
             
             // Create trade record
             ArrayResize(stats.tradeHistory, stats.tradeHistoryCount + 1);
@@ -303,10 +321,13 @@ void BuildTradeHistory()
             stats.tradeHistory[stats.tradeHistoryCount].openPrice = dealPrice;
             stats.tradeHistory[stats.tradeHistoryCount].closePrice = dealPrice;
             stats.tradeHistory[stats.tradeHistoryCount].profit = dealProfit;
+            stats.tradeHistory[stats.tradeHistoryCount].swap = dealSwap;
+            stats.tradeHistory[stats.tradeHistoryCount].commission = dealCommission;
+            stats.tradeHistory[stats.tradeHistoryCount].netProfit = dealProfit + dealSwap + dealCommission;
             stats.tradeHistory[stats.tradeHistoryCount].balanceBefore = runningBalance;
-            stats.tradeHistory[stats.tradeHistoryCount].balanceAfter = runningBalance + dealProfit;
+            stats.tradeHistory[stats.tradeHistoryCount].balanceAfter = runningBalance + dealProfit + dealSwap + dealCommission;
             stats.tradeHistory[stats.tradeHistoryCount].equityBefore = runningEquity;
-            stats.tradeHistory[stats.tradeHistoryCount].equityAfter = runningEquity + dealProfit;
+            stats.tradeHistory[stats.tradeHistoryCount].equityAfter = runningEquity + dealProfit + dealSwap + dealCommission;
             
             // Calculate date components for grouping
             MqlDateTime timeStruct;
@@ -378,16 +399,78 @@ string GetMonthRangeString(datetime time)
 }
 
 //+------------------------------------------------------------------+
+//| Format month display (e.g., "Aug 25" from "2025.08.01-2025.08.31") |
+//+------------------------------------------------------------------+
+string FormatMonthDisplay(string monthRange)
+{
+   // Extract year and month from the range string
+   // Format is "2025.08.01-2025.08.31"
+   string parts[];
+   StringSplit(monthRange, '-', parts);
+   
+   if(ArraySize(parts) >= 2)
+   {
+      string startDate = parts[0]; // "2025.08.01"
+      string dateParts[];
+      StringSplit(startDate, '.', dateParts);
+      
+      if(ArraySize(dateParts) >= 3)
+      {
+         string year = dateParts[0]; // "2025"
+         string month = dateParts[1]; // "08"
+         
+         // Get short month name
+         string monthName = GetMonthName((int)StringToInteger(month));
+         
+         // Get short year (last 2 digits)
+         string shortYear = StringSubstr(year, 2, 2); // "25"
+         
+         return monthName + " " + shortYear; // "Aug 25"
+      }
+   }
+   
+   // Fallback to original format if parsing fails
+   return monthRange;
+}
+
+//+------------------------------------------------------------------+
+//| Get month name from month number                                 |
+//+------------------------------------------------------------------+
+string GetMonthName(int month)
+{
+   switch(month)
+   {
+      case 1: return "Jan";
+      case 2: return "Feb";
+      case 3: return "Mar";
+      case 4: return "Apr";
+      case 5: return "May";
+      case 6: return "Jun";
+      case 7: return "Jul";
+      case 8: return "Aug";
+      case 9: return "Sep";
+      case 10: return "Oct";
+      case 11: return "Nov";
+      case 12: return "Dec";
+      default: return "Unknown";
+   }
+}
+
+//+------------------------------------------------------------------+
 //| Generate daily performance table                                 |
 //+------------------------------------------------------------------+
 string GenerateDailyTable()
 {
    string table = "📅 <b>DAILY PERFORMANCE</b> 📅\n";
-   table += "📊 Date | Trades | Profit " + GetCurrencySymbol() + "\n";
+   table += "📊 Date | Trades | Profit ¢ | Profit %\n";
    
    // Group trades by date
    string dates[];
    double dailyProfits[];
+   double dailySwaps[];
+   double dailyCommissions[];
+   double dailyNetProfits[];
+   double dailyBalanceBefore[];
    int dailyTrades[];
    int dateCount = 0;
    
@@ -402,6 +485,9 @@ string GenerateDailyTable()
          if(dates[j] == currentDate)
          {
             dailyProfits[j] += stats.tradeHistory[i].profit;
+            dailySwaps[j] += stats.tradeHistory[i].swap;
+            dailyCommissions[j] += stats.tradeHistory[i].commission;
+            dailyNetProfits[j] += stats.tradeHistory[i].netProfit;
             dailyTrades[j]++;
             found = true;
             break;
@@ -413,10 +499,18 @@ string GenerateDailyTable()
       {
          ArrayResize(dates, dateCount + 1);
          ArrayResize(dailyProfits, dateCount + 1);
+         ArrayResize(dailySwaps, dateCount + 1);
+         ArrayResize(dailyCommissions, dateCount + 1);
+         ArrayResize(dailyNetProfits, dateCount + 1);
+         ArrayResize(dailyBalanceBefore, dateCount + 1);
          ArrayResize(dailyTrades, dateCount + 1);
          
          dates[dateCount] = currentDate;
          dailyProfits[dateCount] = stats.tradeHistory[i].profit;
+         dailySwaps[dateCount] = stats.tradeHistory[i].swap;
+         dailyCommissions[dateCount] = stats.tradeHistory[i].commission;
+         dailyNetProfits[dateCount] = stats.tradeHistory[i].netProfit;
+         dailyBalanceBefore[dateCount] = stats.tradeHistory[i].balanceBefore;
          dailyTrades[dateCount] = 1;
          dateCount++;
       }
@@ -426,8 +520,22 @@ string GenerateDailyTable()
    int startIndex = MathMax(0, dateCount - 10);
    for(int i = startIndex; i < dateCount; i++)
    {
-      string profitStr = (dailyProfits[i] >= 0) ? "✅ +" + DoubleToString(dailyProfits[i], 2) : "❌ " + DoubleToString(dailyProfits[i], 2);
-      table += dates[i] + " | " + IntegerToString(dailyTrades[i]) + " | " + GetCurrencySymbol() + profitStr + "\n";
+      string profitStr = (dailyNetProfits[i] >= 0) ? "✅ " + DoubleToString(dailyNetProfits[i], 2) : "❌ " + DoubleToString(dailyNetProfits[i], 2);
+      
+      // Calculate profit percentage
+      string profitPercentStr = "";
+      if(dailyBalanceBefore[i] > 0)
+      {
+         double profitPercent = (dailyNetProfits[i] / dailyBalanceBefore[i]) * 100;
+         profitPercentStr = (profitPercent >= 0) ? "✅ " + DoubleToString(profitPercent, 2) : "❌ " + DoubleToString(profitPercent, 2);
+         profitPercentStr += "%";
+      }
+      else
+      {
+         profitPercentStr = "N/A";
+      }
+      
+      table += dates[i] + " | " + IntegerToString(dailyTrades[i]) + " | " + profitStr + " ¢ | " + profitPercentStr + "\n";
    }
    
    if(dateCount == 0)
@@ -443,11 +551,15 @@ string GenerateDailyTable()
 string GenerateWeeklyTable()
 {
    string table = "📆 <b>WEEKLY PERFORMANCE</b> 📆\n";
-   table += "📊 Date | Trades | Profit " + GetCurrencySymbol() + "\n";
+   table += "📊 Date | Trades | Profit ¢ | Profit %\n";
    
    // Group trades by week
    string weeks[];
    double weeklyProfits[];
+   double weeklySwaps[];
+   double weeklyCommissions[];
+   double weeklyNetProfits[];
+   double weeklyBalanceBefore[];
    int weeklyTrades[];
    int weekCount = 0;
    
@@ -462,6 +574,9 @@ string GenerateWeeklyTable()
          if(weeks[j] == currentWeek)
          {
             weeklyProfits[j] += stats.tradeHistory[i].profit;
+            weeklySwaps[j] += stats.tradeHistory[i].swap;
+            weeklyCommissions[j] += stats.tradeHistory[i].commission;
+            weeklyNetProfits[j] += stats.tradeHistory[i].netProfit;
             weeklyTrades[j]++;
             found = true;
             break;
@@ -473,10 +588,18 @@ string GenerateWeeklyTable()
       {
          ArrayResize(weeks, weekCount + 1);
          ArrayResize(weeklyProfits, weekCount + 1);
+         ArrayResize(weeklySwaps, weekCount + 1);
+         ArrayResize(weeklyCommissions, weekCount + 1);
+         ArrayResize(weeklyNetProfits, weekCount + 1);
+         ArrayResize(weeklyBalanceBefore, weekCount + 1);
          ArrayResize(weeklyTrades, weekCount + 1);
          
          weeks[weekCount] = currentWeek;
          weeklyProfits[weekCount] = stats.tradeHistory[i].profit;
+         weeklySwaps[weekCount] = stats.tradeHistory[i].swap;
+         weeklyCommissions[weekCount] = stats.tradeHistory[i].commission;
+         weeklyNetProfits[weekCount] = stats.tradeHistory[i].netProfit;
+         weeklyBalanceBefore[weekCount] = stats.tradeHistory[i].balanceBefore;
          weeklyTrades[weekCount] = 1;
          weekCount++;
       }
@@ -486,8 +609,22 @@ string GenerateWeeklyTable()
    int startIndex = MathMax(0, weekCount - 8);
    for(int i = startIndex; i < weekCount; i++)
    {
-      string profitStr = (weeklyProfits[i] >= 0) ? "✅ +" + DoubleToString(weeklyProfits[i], 2) : "❌ " + DoubleToString(weeklyProfits[i], 2);
-      table += weeks[i] + " | " + IntegerToString(weeklyTrades[i]) + " | " + GetCurrencySymbol() + profitStr + "\n";
+      string profitStr = (weeklyNetProfits[i] >= 0) ? "✅ " + DoubleToString(weeklyNetProfits[i], 2) : "❌ " + DoubleToString(weeklyNetProfits[i], 2);
+      
+      // Calculate profit percentage
+      string profitPercentStr = "";
+      if(weeklyBalanceBefore[i] > 0)
+      {
+         double profitPercent = (weeklyNetProfits[i] / weeklyBalanceBefore[i]) * 100;
+         profitPercentStr = (profitPercent >= 0) ? "✅ " + DoubleToString(profitPercent, 2) : "❌ " + DoubleToString(profitPercent, 2);
+         profitPercentStr += "%";
+      }
+      else
+      {
+         profitPercentStr = "N/A";
+      }
+      
+      table += weeks[i] + " | " + IntegerToString(weeklyTrades[i]) + " | " + profitStr + " ¢ | " + profitPercentStr + "\n";
    }
    
    if(weekCount == 0)
@@ -503,11 +640,15 @@ string GenerateWeeklyTable()
 string GenerateMonthlyTable()
 {
    string table = "📊 <b>MONTHLY PERFORMANCE</b> 📊\n";
-   table += "📈 Date | Trades | Profit " + GetCurrencySymbol() + "\n";
+   table += "📈 Month | Trades | Profit ¢ | Profit %\n";
    
    // Group trades by month
    string months[];
    double monthlyProfits[];
+   double monthlySwaps[];
+   double monthlyCommissions[];
+   double monthlyNetProfits[];
+   double monthlyBalanceBefore[];
    int monthlyTrades[];
    int monthCount = 0;
    
@@ -522,6 +663,9 @@ string GenerateMonthlyTable()
          if(months[j] == currentMonth)
          {
             monthlyProfits[j] += stats.tradeHistory[i].profit;
+            monthlySwaps[j] += stats.tradeHistory[i].swap;
+            monthlyCommissions[j] += stats.tradeHistory[i].commission;
+            monthlyNetProfits[j] += stats.tradeHistory[i].netProfit;
             monthlyTrades[j]++;
             found = true;
             break;
@@ -533,10 +677,18 @@ string GenerateMonthlyTable()
       {
          ArrayResize(months, monthCount + 1);
          ArrayResize(monthlyProfits, monthCount + 1);
+         ArrayResize(monthlySwaps, monthCount + 1);
+         ArrayResize(monthlyCommissions, monthCount + 1);
+         ArrayResize(monthlyNetProfits, monthCount + 1);
+         ArrayResize(monthlyBalanceBefore, monthCount + 1);
          ArrayResize(monthlyTrades, monthCount + 1);
          
          months[monthCount] = currentMonth;
          monthlyProfits[monthCount] = stats.tradeHistory[i].profit;
+         monthlySwaps[monthCount] = stats.tradeHistory[i].swap;
+         monthlyCommissions[monthCount] = stats.tradeHistory[i].commission;
+         monthlyNetProfits[monthCount] = stats.tradeHistory[i].netProfit;
+         monthlyBalanceBefore[monthCount] = stats.tradeHistory[i].balanceBefore;
          monthlyTrades[monthCount] = 1;
          monthCount++;
       }
@@ -546,8 +698,25 @@ string GenerateMonthlyTable()
    int startIndex = MathMax(0, monthCount - 6);
    for(int i = startIndex; i < monthCount; i++)
    {
-      string profitStr = (monthlyProfits[i] >= 0) ? "✅ +" + DoubleToString(monthlyProfits[i], 2) : "❌ " + DoubleToString(monthlyProfits[i], 2);
-      table += months[i] + " | " + IntegerToString(monthlyTrades[i]) + " | " + GetCurrencySymbol() + profitStr + "\n";
+      string profitStr = (monthlyNetProfits[i] >= 0) ? "✅ " + DoubleToString(monthlyNetProfits[i], 2) : "❌ " + DoubleToString(monthlyNetProfits[i], 2);
+      
+      // Calculate profit percentage
+      string profitPercentStr = "";
+      if(monthlyBalanceBefore[i] > 0)
+      {
+         double profitPercent = (monthlyNetProfits[i] / monthlyBalanceBefore[i]) * 100;
+         profitPercentStr = (profitPercent >= 0) ? "✅ " + DoubleToString(profitPercent, 2) : "❌ " + DoubleToString(profitPercent, 2);
+         profitPercentStr += "%";
+      }
+      else
+      {
+         profitPercentStr = "N/A";
+      }
+      
+      // Format month name (e.g., "Aug 25" instead of "2025.08.01-2025.08.31")
+      string monthDisplay = FormatMonthDisplay(months[i]);
+      
+      table += monthDisplay + " | " + IntegerToString(monthlyTrades[i]) + " | " + profitStr + " ¢ | " + profitPercentStr + "\n";
    }
    
    if(monthCount == 0)
@@ -558,9 +727,9 @@ string GenerateMonthlyTable()
 }
 
 //+------------------------------------------------------------------+
-//| Send periodic report with comprehensive tables                   |
+//| Send detailed report with comprehensive tables                   |
 //+------------------------------------------------------------------+
-void SendPeriodicReport()
+void SendDetailedReportFunction()
 {
    // Update trade history if needed
    if(TimeCurrent() - stats.lastHistoryUpdate > 300) // Update every 5 minutes
@@ -620,6 +789,23 @@ void SendPeriodicReport()
    message += "📊 Total Trades: " + IntegerToString(stats.tradeHistoryCount) + "\n";
    message += "⏱️ Bot Running Since: " + TimeToString(stats.botStartTime, TIME_DATE|TIME_MINUTES) + "\n\n";
    
+   // Calculate total costs
+   double totalProfit = 0, totalSwap = 0, totalCommission = 0, totalNetProfit = 0;
+   for(int i = 0; i < stats.tradeHistoryCount; i++)
+   {
+      totalProfit += stats.tradeHistory[i].profit;
+      totalSwap += stats.tradeHistory[i].swap;
+      totalCommission += stats.tradeHistory[i].commission;
+      totalNetProfit += stats.tradeHistory[i].netProfit;
+   }
+   
+   // Add cost breakdown
+   message += "💰 <b>COST BREAKDOWN</b> 💰\n";
+   message += "📈 Gross Profit: " + GetCurrencySymbol() + DoubleToString(totalProfit, 2) + "\n";
+   message += "💸 Total Swap: " + GetCurrencySymbol() + DoubleToString(totalSwap, 2) + "\n";
+   message += "💳 Total Commission: " + GetCurrencySymbol() + DoubleToString(totalCommission, 2) + "\n";
+   message += "💎 Net Profit: " + GetCurrencySymbol() + DoubleToString(totalNetProfit, 2) + "\n\n";
+   
    // Generate comprehensive tables with excitement
    message += GenerateDailyTable();
    message += GenerateWeeklyTable();
@@ -631,7 +817,176 @@ void SendPeriodicReport()
    message += "⭐ <b>PROFIT IS OUR MISSION</b> ⭐\n";
    
    if(UseTelegram)
+   {
       SendTelegramMessage(message);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Send short summary report (simplified)                            |
+//+------------------------------------------------------------------+
+void SendHourlyReportFunction()
+{
+   // Update trade history if needed
+   if(TimeCurrent() - stats.lastHistoryUpdate > 300) // Update every 5 minutes
+   {
+      BuildTradeHistory();
+      stats.lastHistoryUpdate = TimeCurrent();
+   }
+   
+   string message = "";
+   
+   // Add header
+   message += "🚀 <b>SHORT SUMMARY</b> 🚀\n";
+   message += "⚡ <b>LIVE PERFORMANCE UPDATE</b> ⚡\n";
+   message += "⏰ " + TimeToString(TimeCurrent(), TIME_DATE|TIME_MINUTES) + "\n\n";
+   
+   // Account summary
+   double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+   
+   // Calculate floating P&L
+   double floatingPL = 0;
+   for(int i = 0; i < PositionsTotal(); i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket > 0 && PositionSelectByTicket(ticket))
+      {
+         floatingPL += PositionGetDouble(POSITION_PROFIT);
+      }
+   }
+   
+   message += "💰 <b>ACCOUNT STATUS</b> 💰\n";
+   message += "Balance: " + GetCurrencySymbol() + DoubleToString(balance, 2) + "\n";
+   message += "Equity: " + GetCurrencySymbol() + DoubleToString(equity, 2) + "\n";
+   
+   // Calculate floating P&L percentage
+   double floatingPLPercent = 0;
+   if(balance > 0)
+      floatingPLPercent = (floatingPL / balance) * 100;
+   
+   string floatingPLStr = (floatingPL >= 0) ? "✅ " + DoubleToString(floatingPL, 2) : "❌ " + DoubleToString(floatingPL, 2);
+   message += "Floating P&L: " + floatingPLStr + " ¢ (" + DoubleToString(floatingPLPercent, 2) + "%)\n\n";
+   
+   // Calculate today's performance
+   string todayDate = TimeToString(TimeCurrent(), TIME_DATE);
+   double todayProfit = 0;
+   int todayTrades = 0;
+   int todayWins = 0;
+   
+   for(int i = 0; i < stats.tradeHistoryCount; i++)
+   {
+      if(stats.tradeHistory[i].dateStr == todayDate)
+      {
+         todayProfit += stats.tradeHistory[i].netProfit;
+         todayTrades++;
+         if(stats.tradeHistory[i].netProfit > 0)
+            todayWins++;
+      }
+   }
+   
+   double todayProfitPercent = 0;
+   if(balance > 0)
+      todayProfitPercent = (todayProfit / balance) * 100;
+   
+   double todayWinRate = 0;
+   if(todayTrades > 0)
+      todayWinRate = (double)todayWins / todayTrades * 100;
+   
+   message += "🎯 <b>TODAY'S PERFORMANCE</b> 🎯\n";
+   message += "Trades: " + IntegerToString(todayTrades) + "\n";
+   string todayProfitStr = (todayProfit >= 0) ? "✅ " + DoubleToString(todayProfit, 2) : "❌ " + DoubleToString(todayProfit, 2);
+   message += "Profit: " + todayProfitStr + " ¢ (" + DoubleToString(todayProfitPercent, 2) + "%)\n";
+   message += "Win Rate: " + DoubleToString(todayWinRate, 0) + "%\n\n";
+   
+   // Calculate weekly performance
+   datetime weekStart = GetWeekStartTime();
+   double weeklyProfit = 0;
+   int weeklyTrades = 0;
+   int weeklyWins = 0;
+   
+   for(int i = 0; i < stats.tradeHistoryCount; i++)
+   {
+      if(stats.tradeHistory[i].openTime >= weekStart)
+      {
+         weeklyProfit += stats.tradeHistory[i].netProfit;
+         weeklyTrades++;
+         if(stats.tradeHistory[i].netProfit > 0)
+            weeklyWins++;
+      }
+   }
+   
+   double weeklyProfitPercent = 0;
+   if(balance > 0)
+      weeklyProfitPercent = (weeklyProfit / balance) * 100;
+   
+   double weeklyWinRate = 0;
+   if(weeklyTrades > 0)
+      weeklyWinRate = (double)weeklyWins / weeklyTrades * 100;
+   
+   message += "📈 <b>WEEKLY PERFORMANCE</b> 📈\n";
+   message += "Trades: " + IntegerToString(weeklyTrades) + "\n";
+   string weeklyProfitStr = (weeklyProfit >= 0) ? "✅ " + DoubleToString(weeklyProfit, 2) : "❌ " + DoubleToString(weeklyProfit, 2);
+   message += "Profit: " + weeklyProfitStr + " ¢ (" + DoubleToString(weeklyProfitPercent, 2) + "%)\n";
+   message += "Win Rate: " + DoubleToString(weeklyWinRate, 0) + "%\n\n";
+   
+   // Calculate monthly performance
+   datetime monthStart = GetMonthStartTime();
+   double monthlyProfit = 0;
+   int monthlyTrades = 0;
+   int monthlyWins = 0;
+   
+   for(int i = 0; i < stats.tradeHistoryCount; i++)
+   {
+      if(stats.tradeHistory[i].openTime >= monthStart)
+      {
+         monthlyProfit += stats.tradeHistory[i].netProfit;
+         monthlyTrades++;
+         if(stats.tradeHistory[i].netProfit > 0)
+            monthlyWins++;
+      }
+   }
+   
+   double monthlyProfitPercent = 0;
+   if(balance > 0)
+      monthlyProfitPercent = (monthlyProfit / balance) * 100;
+   
+   double monthlyWinRate = 0;
+   if(monthlyTrades > 0)
+      monthlyWinRate = (double)monthlyWins / monthlyTrades * 100;
+   
+   message += "🔥 <b>MONTHLY PERFORMANCE</b> 🔥\n";
+   message += "Trades: " + IntegerToString(monthlyTrades) + "\n";
+   string monthlyProfitStr = (monthlyProfit >= 0) ? "✅ " + DoubleToString(monthlyProfit, 2) : "❌ " + DoubleToString(monthlyProfit, 2);
+   message += "Profit: " + monthlyProfitStr + " ¢ (" + DoubleToString(monthlyProfitPercent, 2) + "%)\n";
+   message += "Win Rate: " + DoubleToString(monthlyWinRate, 0) + "%\n\n";
+   
+   // Total stats
+   double totalProfit = 0;
+   int totalWins = 0;
+   for(int i = 0; i < stats.tradeHistoryCount; i++)
+   {
+      totalProfit += stats.tradeHistory[i].netProfit;
+      if(stats.tradeHistory[i].netProfit > 0)
+         totalWins++;
+   }
+   
+   double totalWinRate = 0;
+   if(stats.tradeHistoryCount > 0)
+      totalWinRate = (double)totalWins / stats.tradeHistoryCount * 100;
+   
+   message += "💎 <b>TOTAL STATS</b> 💎\n";
+   message += "Total Trades: " + IntegerToString(stats.tradeHistoryCount) + "\n";
+   string totalProfitStr = (totalProfit >= 0) ? "✅ " + DoubleToString(totalProfit, 2) : "❌ " + DoubleToString(totalProfit, 2);
+   message += "Total Profit: " + totalProfitStr + " ¢\n";
+   message += "Win Rate: " + DoubleToString(totalWinRate, 0) + "%\n";
+   message += "Max DD: " + DoubleToString(stats.maxCurrentDD, 1) + "%\n";
+   message += "\n💪 <b>KEEP TRADING, KEEP WINNING!</b> 💪\n";
+   
+   if(UseTelegram)
+   {
+      SendTelegramMessage(message);
+   }
 }
 
 //+------------------------------------------------------------------+
@@ -1000,7 +1355,7 @@ void UpdateBotDrawdown()
    {
       // Calculate floating P&L
       double floatingPL = 0;
-      for(int i = 0; i < PositionsTotal(); i++)
+   for(int i = 0; i < PositionsTotal(); i++)
       {
          ulong ticket = PositionGetTicket(i);
          if(ticket > 0 && PositionSelectByTicket(ticket))
@@ -1025,3 +1380,4 @@ void UpdateBotDrawdown()
       stats.botMaxDD = currentDD;
    }
 }
+
